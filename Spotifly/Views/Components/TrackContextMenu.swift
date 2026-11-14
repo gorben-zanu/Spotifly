@@ -1,0 +1,265 @@
+//
+//  TrackContextMenu.swift
+//  Spotifly
+//
+//  Reusable context menu for tracks - used in TrackRow and on cards
+//
+
+import SwiftUI
+
+/// Reusable context menu content for tracks
+struct TrackContextMenu: View {
+    let track: Track
+    let currentSection: NavigationItem
+    let selectionId: String?
+    /// The playlist item this menu was opened from, where the caller knows which one.
+    let itemUid: String?
+
+    @Environment(PlaybackViewModel.self) private var playbackViewModel
+    @Environment(NavigationCoordinator.self) private var navigationCoordinator
+    @Environment(AppStore.self) private var store
+    @Environment(TrackService.self) private var trackService
+    @Environment(PlaylistService.self) private var playlistService
+
+    @Binding var showNewPlaylistDialog: Bool
+    var onPlaylistAdded: (() -> Void)?
+    var onNavigate: (() -> Void)?
+
+    /// Favorite status from the store
+    private var isFavorited: Bool {
+        store.isFavorite(track.id)
+    }
+
+    /// The row to remove, when there is one the user can remove and this menu can name.
+    ///
+    /// Removing is only offered inside a playlist the user owns: the menu is reused from
+    /// albums, search and the queue, where "this playlist" would mean nothing, and Spotify
+    /// rejects the edit for a playlist someone else owns.
+    ///
+    /// **The uid is required, not preferred.** Without it the menu can only say "a row holding
+    /// this song", and a playlist may hold the same song twice — so the removal would land on
+    /// whichever copy came first rather than the one the user right-clicked. Requiring it makes
+    /// that unrepresentable instead of a fallback: the only screen that offers this is the
+    /// playlist page, and it has the uid.
+    private var removableItem: (playlistId: String, uid: String)? {
+        guard currentSection == .playlists,
+              let playlistId = selectionId,
+              let itemUid,
+              store.playlists[playlistId]?.ownerId == store.userId
+        else {
+            return nil
+        }
+        return (playlistId, itemUid)
+    }
+
+    var body: some View {
+        // Single unified action - "Play Next" adds to queue (plays before context tracks)
+        Button {
+            addToQueue()
+        } label: {
+            Label("track.menu.play_next", systemImage: "text.line.first.and.arrowtriangle.forward")
+        }
+        // A track Spotify will not play starts nothing.
+        .disabled(!track.isPlayable)
+
+        Button {
+            startSongRadio()
+        } label: {
+            Label("track.menu.start_radio", systemImage: "antenna.radiowaves.left.and.right")
+        }
+        .disabled(!track.isPlayable)
+
+        Divider()
+
+        // Favorite toggle
+        Button {
+            toggleFavorite()
+        } label: {
+            Label(
+                .favoriteToggle(isFavorited: isFavorited),
+                systemImage: isFavorited ? "heart.slash" : "heart",
+            )
+        }
+
+        // Playlist Management Section
+        Menu {
+            Button {
+                showNewPlaylistDialog = true
+            } label: {
+                Label("track.menu.add_to_new_playlist", systemImage: "plus")
+            }
+
+            PlaylistSubmenuContent(
+                store: store,
+                playlistService: playlistService,
+                onAddToPlaylist: addToPlaylist,
+            )
+        } label: {
+            Label("track.menu.add_to_playlist", systemImage: "music.note.list")
+        }
+
+        if let item = removableItem {
+            Button(role: .destructive) {
+                removeFromPlaylist(playlistId: item.playlistId, uid: item.uid)
+            } label: {
+                Label("track.menu.remove_from_playlist", systemImage: "minus.circle")
+            }
+        }
+
+        Divider()
+
+        Button {
+            if let artistId = track.artistId {
+                onNavigate?()
+                navigationCoordinator.navigateToArtistSection(artistId: artistId)
+            }
+        } label: {
+            Label("track.menu.go_to_artist", systemImage: "person.circle")
+        }
+        .disabled(track.artistId == nil || (currentSection == .artists && track.artistId == selectionId))
+
+        Button {
+            if let albumId = track.albumId {
+                onNavigate?()
+                navigationCoordinator.navigateToAlbumSection(albumId: albumId)
+            }
+        } label: {
+            Label("track.menu.go_to_album", systemImage: "square.stack")
+        }
+        .disabled(track.albumId == nil || (currentSection == .albums && track.albumId == selectionId))
+
+        Divider()
+
+        Button {
+            copyToClipboard()
+        } label: {
+            Label("action.share", systemImage: "square.and.arrow.up")
+        }
+        .disabled(SpotifyURI.webURL(track.uri) == nil)
+    }
+
+    // MARK: - Actions
+
+    private func copyToClipboard() {
+        guard let link = SpotifyURI.webURL(track.uri) else { return }
+        NSPasteboard.copy(link)
+    }
+
+    private func addToQueue() {
+        Task {
+            await playbackViewModel.addToQueue(uri: track.uri)
+        }
+    }
+
+    private func startSongRadio() {
+        Task {
+            await playbackViewModel.playRadio(trackUri: track.uri)
+            onNavigate?()
+            navigationCoordinator.navigateToQueue()
+        }
+    }
+
+    private func toggleFavorite() {
+        Task {
+            do {
+                try await trackService.toggleFavorite(trackId: track.id)
+            } catch {
+                playbackViewModel.errorMessage = String(localized: "error.update_favorite \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func addToPlaylist(playlistId: String) {
+        Task {
+            do {
+                try await playlistService.addTracksToPlaylist(
+                    playlistId: playlistId,
+                    trackIds: [track.id],
+                )
+                onPlaylistAdded?()
+            } catch {
+                playbackViewModel.errorMessage = String(localized: "error.add_to_playlist \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func removeFromPlaylist(playlistId: String, uid: String) {
+        Task {
+            do {
+                try await playlistService.removePlaylistItems(
+                    playlistId: playlistId,
+                    uids: [uid],
+                )
+            } catch {
+                playbackViewModel.errorMessage = String(localized: "error.remove_from_playlist \(error.localizedDescription)")
+            }
+        }
+    }
+}
+
+// MARK: - Convenience initializer with constant binding
+
+extension TrackContextMenu {
+    /// Initialize without playlist dialog support (for context menus)
+    init(
+        track: Track,
+        currentSection: NavigationItem = .startpage,
+        selectionId: String? = nil,
+        itemUid: String? = nil,
+    ) {
+        self.track = track
+        self.currentSection = currentSection
+        self.selectionId = selectionId
+        self.itemUid = itemUid
+        _showNewPlaylistDialog = .constant(false)
+        onPlaylistAdded = nil
+        onNavigate = nil
+    }
+}
+
+// MARK: - Playlist Submenu Content (lazy loading)
+
+/// A view that loads playlists on-demand when the submenu appears
+struct PlaylistSubmenuContent: View {
+    let store: AppStore
+    let playlistService: PlaylistService
+    let onAddToPlaylist: (String) -> Void
+
+    @State private var hasTriggeredLoad = false
+
+    private var ownedPlaylists: [Playlist] {
+        store.userPlaylists.filter { $0.ownerId == store.userId }
+    }
+
+    var body: some View {
+        // Nothing to list yet — whether a load is running or has not started — so show the
+        // placeholder and kick one off. Both cases used to be spelled out separately with
+        // byte-identical bodies.
+        if ownedPlaylists.isEmpty {
+            Text("loading.playlists")
+                .foregroundStyle(.secondary)
+                .onAppear {
+                    triggerLoadIfNeeded()
+                }
+        } else {
+            Divider()
+
+            ForEach(ownedPlaylists) { playlist in
+                Button(playlist.name) {
+                    onAddToPlaylist(playlist.id)
+                }
+            }
+        }
+    }
+
+    private func triggerLoadIfNeeded() {
+        guard !hasTriggeredLoad else { return }
+        hasTriggeredLoad = true
+
+        Task {
+            if store.userPlaylists.isEmpty, !store.playlistsPagination.isLoading {
+                try? await playlistService.loadUserPlaylists()
+            }
+        }
+    }
+}

@@ -1,0 +1,333 @@
+//
+//  NavigationCoordinator.swift
+//  Spotifly
+//
+//  Owns the logged-in shell's current route and back/forward history.
+//
+
+import SwiftUI
+
+/// Centralized navigation coordinator that can be accessed from anywhere in the app.
+@MainActor
+@Observable
+final class NavigationCoordinator {
+    static let historyLimit = 100
+
+    private weak var store: AppStore?
+    private var lastSelection: [NavigationItem: Selection] = [:]
+    /// The last search shown with results; see `reopenableSearchQuery`.
+    private var lastDisplayedSearchQuery: String?
+
+    private(set) var current: Route = .startpage
+    private(set) var back: [Route] = []
+    private(set) var forward: [Route] = []
+
+    init(store: AppStore) {
+        self.store = store
+    }
+
+    // MARK: - Route Projections
+
+    var selectedNavigationItem: NavigationItem? {
+        get { current.section }
+        set { selectNavigationItem(newValue) }
+    }
+
+    var selectedAlbumId: String? {
+        get {
+            guard case let .album(id) = current.selection else { return nil }
+            return id
+        }
+        set { selectAlbum(newValue) }
+    }
+
+    var selectedArtistId: String? {
+        get {
+            guard case let .artist(id) = current.selection else { return nil }
+            return id
+        }
+        set { selectArtist(newValue) }
+    }
+
+    var selectedPlaylistId: String? {
+        get {
+            guard case let .playlist(id) = current.selection else { return nil }
+            return id
+        }
+        set { selectPlaylist(newValue) }
+    }
+
+    /// An entity is ephemeral only as a presentation detail. Membership never forms
+    /// part of the route or its history identity.
+    var viewingAlbumId: String? {
+        guard let id = selectedAlbumId, store?.userAlbumIds.contains(id) != true else { return nil }
+        return id
+    }
+
+    var viewingArtistId: String? {
+        guard let id = selectedArtistId, store?.userArtistIds.contains(id) != true else { return nil }
+        return id
+    }
+
+    var viewingPlaylistId: String? {
+        guard let id = selectedPlaylistId, store?.userPlaylistIds.contains(id) != true else { return nil }
+        return id
+    }
+
+    var displayedSearchQuery: String? {
+        current.section == .searchResults ? current.query : nil
+    }
+
+    /// The query the sidebar's search row reopens to: the last one shown with results, never a
+    /// failed one, while the cache still holds them.
+    var reopenableSearchQuery: String? {
+        guard let query = lastDisplayedSearchQuery, store?.searchResults(for: query) != nil else { return nil }
+        return query
+    }
+
+    var needsThreeColumnLayout: Bool {
+        switch current.section {
+        case .albums, .artists, .playlists:
+            true
+        default:
+            false
+        }
+    }
+
+    var canNavigateBackward: Bool {
+        !back.isEmpty
+    }
+
+    var canNavigateForward: Bool {
+        !forward.isEmpty
+    }
+
+    var backNavigationTitle: String? {
+        back.last.map(title(for:))
+    }
+
+    var forwardNavigationTitle: String? {
+        forward.last.map(title(for:))
+    }
+
+    // MARK: - Navigation
+
+    func selectNavigationItem(_ section: NavigationItem?) {
+        let route = switch section {
+        case .albums, .artists, .playlists:
+            Route(section: section, selection: section.flatMap { lastSelection[$0] })
+        case .searchResults:
+            // The last search shown, or the search page with recent searches.
+            Route(section: .searchResults, query: reopenableSearchQuery)
+        default:
+            Route(section: section)
+        }
+
+        navigate(to: route)
+    }
+
+    func navigateToSearchResults(query: String) {
+        guard store?.canShowSearch(for: query) == true else { return }
+        navigate(to: Route(section: .searchResults, query: query))
+    }
+
+    func selectAlbum(_ albumId: String?, recordsHistory: Bool = true) {
+        setSelection(albumId.map { .album(id: $0) }, for: .albums, recordsHistory: recordsHistory)
+    }
+
+    func selectArtist(_ artistId: String?, recordsHistory: Bool = true) {
+        setSelection(artistId.map { .artist(id: $0) }, for: .artists, recordsHistory: recordsHistory)
+    }
+
+    func selectPlaylist(_ playlistId: String?, recordsHistory: Bool = true) {
+        setSelection(playlistId.map { .playlist(id: $0) }, for: .playlists, recordsHistory: recordsHistory)
+    }
+
+    /// Shows one kind of the shown search's results, or all of them, as a step of its own in
+    /// the history.
+    func showSearchScope(_ scope: SearchKind?) {
+        guard displayedSearchQuery != nil, scope != current.searchScope else { return }
+        var route = current
+        route.searchScope = scope
+        navigate(to: route)
+    }
+
+    /// The search page before a search, as the field is emptied.
+    func showSearchHome() {
+        navigate(to: Route(section: .searchResults))
+    }
+
+    /// Navigate directly to the Albums section and a specific album.
+    func navigateToAlbumSection(albumId: String) {
+        navigate(to: Route(showing: .album(id: albumId)))
+    }
+
+    /// Navigate directly to the Artists section and a specific artist.
+    func navigateToArtistSection(artistId: String) {
+        navigate(to: Route(showing: .artist(id: artistId)))
+    }
+
+    /// Navigate directly to the Playlists section and a specific playlist.
+    func navigateToPlaylistSection(playlistId: String) {
+        navigate(to: Route(showing: .playlist(id: playlistId)))
+    }
+
+    /// Navigate directly to the queue.
+    func navigateToQueue() {
+        selectNavigationItem(.queue)
+    }
+
+    func navigateBackward() {
+        guard let previous = back.popLast() else { return }
+        forward.append(current)
+        restore(previous)
+    }
+
+    func navigateForward() {
+        guard let next = forward.popLast() else { return }
+        appendToBack(current)
+        restore(next)
+    }
+
+    // MARK: - Selection Helpers
+
+    /// Remove deleted playlist routes from the complete history sequence.
+    func clearPlaylistSelection() {
+        invalidateUnviewableRoutes()
+    }
+
+    // MARK: - Invalidation
+
+    /// Removes every unviewable route from the full chronological history, collapses
+    /// equal adjacent runs, then rebuilds back/current/forward around the survivor.
+    func invalidateUnviewableRoutes() {
+        lastSelection = lastSelection.filter { _, selection in
+            store?.deletedEntitySelections.contains(selection) != true
+        }
+
+        let chronological = back + [current] + forward.reversed()
+        let oldCurrentIndex = back.count
+
+        // Runs of *adjacent* equal routes collapse, never duplicates elsewhere in the
+        // sequence: revisiting a place is a real step and has to stay replayable.
+        let runs = chronological.enumerated()
+            .filter { isViewable($0.element) }
+            .reduce(into: [RouteRun]()) { runs, entry in
+                guard runs.last?.route != entry.element else { return }
+                runs.append(RouteRun(route: entry.element, firstIndex: entry.offset))
+            }
+
+        guard !runs.isEmpty else {
+            back = []
+            forward = []
+            restore(.startpage)
+            return
+        }
+
+        // Runs stay in chronological order, so the last one starting at or before the old
+        // position is either the run holding it or — if it was dropped — the nearest
+        // survivor behind it.
+        let currentRunIndex = runs.lastIndex { $0.firstIndex <= oldCurrentIndex } ?? runs.startIndex
+
+        back = runs[..<currentRunIndex].map(\.route)
+        forward = runs[(currentRunIndex + 1)...].map(\.route).reversed()
+        restore(runs[currentRunIndex].route)
+    }
+
+    // MARK: - Internal History Logic
+
+    /// A surviving route together with where its run began in the pre-collapse sequence.
+    private struct RouteRun {
+        var route: Route
+        var firstIndex: Int
+    }
+
+    private func setSelection(_ selection: Selection?, for section: NavigationItem, recordsHistory: Bool) {
+        guard current.section == section else { return }
+
+        if let selection {
+            lastSelection[section] = selection
+        } else {
+            lastSelection.removeValue(forKey: section)
+        }
+
+        var route = current
+        route.selection = selection
+        if recordsHistory {
+            navigate(to: route)
+        } else {
+            replace(with: route)
+        }
+    }
+
+    /// Goes to a route as a new location, such as the page of a context uri
+    /// (`Route(contextUri:)`).
+    func navigate(to route: Route) {
+        if route != current {
+            appendToBack(current)
+            current = route
+            forward.removeAll()
+        }
+        noteRouteDisplayed(route)
+    }
+
+    private func replace(with route: Route) {
+        guard route != current else { return }
+        current = route
+        while back.last == current {
+            back.removeLast()
+        }
+        while forward.last == current {
+            forward.removeLast()
+        }
+        noteRouteDisplayed(route)
+    }
+
+    private func restore(_ route: Route) {
+        current = route
+        noteRouteDisplayed(route)
+    }
+
+    private func appendToBack(_ route: Route) {
+        back.append(route)
+        if back.count > Self.historyLimit {
+            back.removeFirst(back.count - Self.historyLimit)
+        }
+    }
+
+    /// Bookkeeping for a route that has just become the visible one: the selection its
+    /// section reopens to, and — for a search route — the query the sidebar reopens to.
+    /// Both are memos outside `Route`, so neither takes part in history identity.
+    private func noteRouteDisplayed(_ route: Route) {
+        if let section = route.section, let selection = route.selection {
+            lastSelection[section] = selection
+        }
+
+        if route.section == .searchResults, let query = route.query, store?.searchResults(for: query) != nil {
+            lastDisplayedSearchQuery = query
+        }
+    }
+
+    private func isViewable(_ route: Route) -> Bool {
+        // The search page without a query, recent searches, is always there to show.
+        if route.section == .searchResults, let query = route.query {
+            guard store?.canShowSearch(for: query) == true else { return false }
+        }
+
+        if let selection = route.selection, store?.deletedEntitySelections.contains(selection) == true {
+            return false
+        }
+
+        return true
+    }
+
+    /// An entity missing from the store falls back to the route's own section.
+    private func title(for route: Route) -> String {
+        if let scope = route.searchScope {
+            return scope.title
+        }
+
+        let sectionTitle = route.section?.title ?? String(localized: "app.name")
+        return route.selection.flatMap { store?.name(of: $0) } ?? sectionTitle
+    }
+}

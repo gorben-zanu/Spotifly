@@ -1,0 +1,590 @@
+//
+//  Entities.swift
+//  Spotifly
+//
+//  Unified entity models for normalized state management.
+//  These are the canonical representations stored in AppStore.
+//
+
+import Foundation
+
+// MARK: - Image Types
+
+/// A single image variant with its URL and pixel dimensions.
+struct ImageVariant: Hashable, Encodable {
+    let url: URL
+    let size: Int // width in pixels (images are square)
+}
+
+/// A collection of image variants at different resolutions.
+/// Stores all sizes returned by the Spotify API and provides
+/// resolution-aware selection based on display size and scale.
+struct ImageSet: Hashable, Encodable {
+    /// Sorted descending by size (largest first), matching Spotify's default order.
+    let variants: [ImageVariant]
+
+    /// Returns the best image URL for a given display size in points.
+    ///
+    /// Uses 20% tolerance — accepts a variant that covers at least 80% of the
+    /// target pixel size. This lets small views (34–40pt) use the 64px variant
+    /// instead of downloading the 300px image.
+    ///
+    /// - Parameters:
+    ///   - points: The display size in SwiftUI points (e.g. 120 for a 120×120pt view).
+    ///   - scale: The display scale factor (1.0 for non-retina, 2.0 for retina).
+    ///            Defaults to 2.0 since all modern Macs are retina.
+    /// - Returns: The URL of the best-fit image, or nil if no variants exist.
+    func url(for points: CGFloat, scale: CGFloat = 2.0) -> URL? {
+        guard !variants.isEmpty else { return nil }
+        let target = Int(points * scale)
+        let threshold = target * 4 / 5
+        // Smallest variant >= threshold, fallback to largest
+        let best = variants.reversed().first(where: { $0.size >= threshold })
+        return (best ?? variants.first)?.url
+    }
+
+    /// The medium image URL (~300px), suitable for Now Playing metadata
+    /// and general-purpose use where display size is unknown.
+    var mediumURL: URL? {
+        let medium = variants.first(where: { $0.size <= 400 && $0.size >= 100 })
+        return (medium ?? variants.first)?.url
+    }
+
+    var isEmpty: Bool {
+        variants.isEmpty
+    }
+
+    /// An empty image set with no variants.
+    static let empty = ImageSet(variants: [])
+}
+
+// MARK: - Track
+
+/// Unified track entity - single source of truth for all track data.
+/// Built from the pathfinder and spclient responses in `PartnerAPI/`.
+struct Track: Identifiable, Hashable, Encodable {
+    let id: String
+    let name: String
+    let uri: String
+    let durationMs: Int
+    let trackNumber: Int?
+
+    // Relationships (stored as IDs, not nested objects)
+    let albumId: String?
+    let artistId: String?
+
+    // Denormalized for display (avoids extra lookups for common display patterns)
+    let artistName: String
+    let albumName: String?
+    let images: ImageSet
+
+    /// Whether Spotify will play this track for the account. `.playable` unless the answer it
+    /// came from said otherwise: pathfinder's `playability`, or spclient's restrictions.
+    var playability = Playability.playable
+
+    var durationFormatted: String {
+        formatTrackTime(milliseconds: durationMs)
+    }
+
+    var isPlayable: Bool {
+        playability == .playable
+    }
+
+    /// What to tell the user when this track will not play here: that it is not available in
+    /// their country, where that is Spotify's reason, and otherwise that it is not available.
+    var unplayableMessage: String? {
+        guard case let .unplayable(reason) = playability else { return nil }
+        return reason == Playability.countryRestricted
+            ? String(localized: "error.track_unavailable_in_country \(name)")
+            : String(localized: "error.track_unavailable \(name)")
+    }
+}
+
+/// Whether a track plays for the account. Spotify withholds some everywhere, and some only in
+/// the account's country (`COUNTRY_RESTRICTED`); its clients grey those rows out. An album's
+/// unplayable tracks come without a reason.
+enum Playability: Hashable, Encodable {
+    case playable
+    case unplayable(reason: String?)
+
+    /// Pathfinder's reason for a track withheld in the account's country.
+    static let countryRestricted = "COUNTRY_RESTRICTED"
+}
+
+// MARK: - Album
+
+/// Unified album entity.
+struct Album: Identifiable, Hashable, Encodable {
+    let id: String
+    let name: String
+    let uri: String
+    let images: ImageSet
+    var releaseDate: String?
+    var albumType: String?
+
+    // Relationships
+    let artistId: String?
+    let artistName: String // Denormalized for display
+
+    // Mutable state (populated when tracks are loaded)
+    var trackIds: [String]
+    var totalDurationMs: Int?
+
+    /// Whether every field came from a source that returns them all.
+    ///
+    /// False for the stubs built out of a shelf entry or an artist's release list, which
+    /// carry no release date or album type. `AlbumService` uses this to decide
+    /// whether the metadata request can be skipped — presence in the store alone would not
+    /// be enough.
+    var detailsLoaded: Bool
+
+    /// Whether the track list was fetched. Stored rather than derived from
+    /// `trackIds`, so an album that genuinely has no tracks is not re-fetched on
+    /// every single visit.
+    var tracksLoaded: Bool
+
+    /// Known count from API (before tracks are loaded)
+    private var _knownTrackCount: Int?
+
+    /// Track count - uses loaded trackIds if available, otherwise falls back to API count
+    var trackCount: Int {
+        tracksLoaded ? trackIds.count : (_knownTrackCount ?? 0)
+    }
+
+    /// The year the release date starts with, which Spotify gives as a year, a month or a day.
+    var releaseYear: String? {
+        releaseDate.map { String($0.prefix(4)) }.flatMap { Int($0) != nil ? $0 : nil }
+    }
+
+    /// Memberwise initializer with all fields
+    init(
+        id: String,
+        name: String,
+        uri: String,
+        images: ImageSet,
+        releaseDate: String?,
+        albumType: String?,
+        artistId: String?,
+        artistName: String,
+        trackIds: [String] = [],
+        totalDurationMs: Int? = nil,
+        knownTrackCount: Int? = nil,
+        detailsLoaded: Bool,
+        tracksLoaded: Bool = false,
+    ) {
+        self.id = id
+        self.name = name
+        self.uri = uri
+        self.images = images
+        self.releaseDate = releaseDate
+        self.albumType = albumType
+        self.artistId = artistId
+        self.artistName = artistName
+        self.trackIds = trackIds
+        self.totalDurationMs = totalDurationMs
+        self.detailsLoaded = detailsLoaded
+        self.tracksLoaded = tracksLoaded
+        _knownTrackCount = knownTrackCount
+    }
+}
+
+// MARK: - Artist
+
+/// Unified artist entity.
+struct Artist: Identifiable, Hashable, Encodable {
+    let id: String
+    let name: String
+    let uri: String
+    let images: ImageSet
+}
+
+// MARK: - Playlist
+
+/// Unified playlist entity.
+struct Playlist: Identifiable, Hashable, Encodable {
+    let id: String
+    var name: String // Mutable - can be edited
+    var description: String?
+    var images: ImageSet
+    let uri: String
+    var isPublic: Bool
+    var ownerId: String
+    let ownerName: String
+
+    // Mutable state (populated when tracks are loaded)
+    var items: [PlaylistItem]
+    var totalDurationMs: Int?
+
+    /// Whether the track list was fetched. Stored rather than derived from
+    /// `items`, so an empty playlist — or one the user just emptied — is not
+    /// re-fetched on every single visit.
+    var tracksLoaded: Bool
+
+    /// Known count from API (before tracks are loaded)
+    private var _knownTrackCount: Int?
+
+    /// Track count - uses loaded items if available, otherwise falls back to API count
+    var trackCount: Int {
+        tracksLoaded ? items.count : (_knownTrackCount ?? 0)
+    }
+
+    /// The tracks in order, for the many readers that do not care which occurrence is which.
+    var trackIds: [String] {
+        items.map(\.trackId)
+    }
+
+    /// Memberwise initializer with all fields
+    init(
+        id: String,
+        name: String,
+        description: String?,
+        images: ImageSet,
+        uri: String,
+        isPublic: Bool,
+        ownerId: String,
+        ownerName: String,
+        items: [PlaylistItem] = [],
+        totalDurationMs: Int? = nil,
+        knownTrackCount: Int? = nil,
+        tracksLoaded: Bool = false,
+    ) {
+        self.id = id
+        self.name = name
+        self.description = description
+        self.images = images
+        self.uri = uri
+        self.isPublic = isPublic
+        self.ownerId = ownerId
+        self.ownerName = ownerName
+        self.items = items
+        self.totalDurationMs = totalDurationMs
+        self.tracksLoaded = tracksLoaded
+        _knownTrackCount = knownTrackCount
+    }
+}
+
+/// One entry in a playlist: a track, and the id of *this occurrence* of it.
+///
+/// The `uid` is what the client's own API mutates by — `removeFromPlaylist` and
+/// `moveItemsInPlaylist` both take uids, not track uris — and it is why a playlist holds items
+/// rather than plain track ids.
+///
+/// It also fixes a defect the Web API path had: removing by track uri deletes **every** copy of
+/// that track in the playlist, so a playlist holding the same song twice lost both when the user
+/// removed one. A uid names one occurrence.
+struct PlaylistItem: Identifiable, Hashable, Encodable {
+    /// Stable per occurrence, assigned by Spotify.
+    let uid: String
+    let trackId: String
+
+    /// `Identifiable` on the uid rather than the track: two rows for the same song are two
+    /// rows, and a `ForEach` keyed by track id would treat them as one.
+    var id: String {
+        uid
+    }
+}
+
+// MARK: - Home
+
+/// One shelf of the start page: a heading, and ids into the entity tables.
+///
+/// **Holds ids rather than entities**, like every other ordered collection here, so a playlist
+/// renamed on the playlist page is renamed on the start page too. The entities themselves are
+/// upserted when the page loads.
+struct HomeSection: Identifiable, Hashable, Encodable {
+    /// Spotify's own `spotify:section:…` uri. Stable across loads, which is what lets SwiftUI
+    /// keep scroll position when the page refreshes.
+    let id: String
+    /// Absent for shelves Spotify draws without a heading — the "shorts" row is one.
+    let title: String?
+    let items: [HomeItem]
+    /// Whether it holds the contexts last played, which the start page shows as "Zuletzt gehört".
+    var isRecentlyPlayed = false
+}
+
+/// The listener's top tracks and artists over one time range, as ids into the store.
+struct TopContent: Hashable, Encodable {
+    let trackIds: [String]
+    let artistIds: [String]
+}
+
+/// What a shelf entry points at. Deliberately only the three kinds this app can open: a row
+/// leading nowhere is worse than a row that is not there.
+enum HomeItem: Identifiable, Hashable, Encodable {
+    case album(String)
+    case playlist(String)
+    case artist(String)
+
+    /// Qualified by kind, because an album and a playlist can share a base62 id and a `ForEach`
+    /// would then treat them as the same row.
+    var id: String {
+        switch self {
+        case let .album(id): "album:\(id)"
+        case let .playlist(id): "playlist:\(id)"
+        case let .artist(id): "artist:\(id)"
+        }
+    }
+}
+
+// MARK: - User Profile
+
+/// User profile (singleton, not stored in entity table).
+struct UserProfile {
+    let id: String
+    let displayName: String
+    let imageURL: URL?
+    let externalUrl: String?
+    let uri: String?
+}
+
+// MARK: - Device
+
+/// Spotify Connect device.
+nonisolated struct Device: Identifiable, Hashable, Encodable {
+    let id: String
+    let name: String
+    let type: String
+    let isActive: Bool
+    let isPrivateSession: Bool
+    let isRestricted: Bool
+    let volumePercent: Int?
+
+    /// Whether the device refuses remote volume changes, as the cluster declares.
+    ///
+    /// Named after the wire field rather than flipped to `canSetVolume`, so one term can be
+    /// followed from the protobuf through the cluster's device list to here without a reader
+    /// having to notice where the sense inverts.
+    ///
+    /// An iPhone sets it — iOS will not let an app change system volume for another app — and
+    /// the app used to find out only by sending the command and getting
+    /// `400 DEVICE_DOES_NOT_SUPPORT_COMMAND` back, after the user had already dragged the slider.
+    var disableVolume: Bool = false
+}
+
+// MARK: - Spotify Connection
+
+/// Our app's connection state to Spotify (single source of truth for connection info).
+/// Converted from LibrespotConnectionState in `PlayerModel`.
+struct SpotifyConnection: Equatable, Encodable {
+    let deviceId: String?
+    let deviceName: String
+    let isConnected: Bool
+    let connectedSince: Date?
+    let reconnectAttempts: UInt32
+    let lastError: String?
+    /// Whether this Mac may play for the account. See `LibrespotConnectionState.streams`.
+    let streams: Bool
+}
+
+// MARK: - Queue Models
+
+/// Indicates the source of a track in the queue (matches librespot provider values)
+enum TrackProvider: String, Codable {
+    case queue // Manually added to queue
+    case context // From current album/playlist/artist
+    case autoplay // Autoplay suggestion
+    case unavailable // Track is unavailable
+
+    /// Parse from librespot provider string. Anything unrecognised is a track this app has
+    /// no row for, which is what `.unavailable` already means.
+    init(from providerString: String) {
+        self = TrackProvider(rawValue: providerString) ?? .unavailable
+    }
+}
+
+// MARK: - Search Results
+
+/// One search's four result lists, cached per query by `AppStore`, in the order Spotify ranked
+/// them.
+///
+/// **Holds ids rather than entities**, like the start page's shelves, so a track greyed or a
+/// playlist renamed after the search shows that way here too. The entities themselves are
+/// upserted when the search answers.
+///
+/// Each list is deduplicated: relinking can give two track results one market id (`AGENTS.md`,
+/// "Track identity is the market id"), and the page keys its rows by id.
+struct SearchResults: Encodable {
+    /// Which run of the search these are: a page loaded for an earlier run of the same query
+    /// does not continue a later one's offsets.
+    let id = UUID()
+    private(set) var ids: [SearchKind: [String]] = [:]
+    /// Where each kind's next page starts: every result Spotify has sent, duplicates included,
+    /// as `PaginationState` counts its offset.
+    private(set) var nextOffset: [SearchKind: Int] = [:]
+    /// The kinds whose last page came back short, so there is nothing more to load.
+    private(set) var exhausted: Set<SearchKind> = []
+
+    var trackIds: [String] {
+        ids(for: .tracks)
+    }
+
+    var albumIds: [String] {
+        ids(for: .albums)
+    }
+
+    var artistIds: [String] {
+        ids(for: .artists)
+    }
+
+    var playlistIds: [String] {
+        ids(for: .playlists)
+    }
+
+    /// One kind's ids, in the order found.
+    func ids(for kind: SearchKind) -> [String] {
+        ids[kind] ?? []
+    }
+
+    /// Adds a page of one kind: its ids, leaving out those already listed, and how many results
+    /// Spotify sent for it, which a page short of `pageSize` marks as the last.
+    mutating func append(_ newIds: [String], to kind: SearchKind, sent: Int, pageSize: Int) {
+        let known = Set(ids(for: kind))
+        ids[kind, default: []] += newIds.uniqued().filter { !known.contains($0) }
+        nextOffset[kind, default: 0] += sent
+        if sent < pageSize {
+            exhausted.insert(kind)
+        }
+    }
+
+    init() {}
+
+    init(albums: [Album], artists: [Artist], playlists: [Playlist], tracks: [Track]) {
+        ids = [
+            .albums: albums.map(\.id).uniqued(),
+            .artists: artists.map(\.id).uniqued(),
+            .playlists: playlists.map(\.id).uniqued(),
+            .tracks: tracks.map(\.id).uniqued(),
+        ]
+    }
+}
+
+// MARK: - Duplicate Ids
+
+extension Sequence where Element: Hashable {
+    /// First occurrence of each element, in order.
+    ///
+    /// Needed in more places than it looks, because relinking is **many-to-one**: several
+    /// saved recordings can share one market id, which is the id the app keys tracks by
+    /// (`AGENTS.md`, "Track identity is the market id"). So a library page can name the same
+    /// track twice, a queue can hold one track more than once, and every collection built
+    /// from track ids has to survive that.
+    nonisolated func uniqued() -> [Element] {
+        var seen = Set<Element>()
+        return filter { seen.insert($0).inserted }
+    }
+}
+
+extension Array {
+    /// The index of the element matching `predicate` that is nearest `target`, the earlier one
+    /// on a tie, or nil when none matches.
+    ///
+    /// For a track a list can hold more than once: the track a double-click starts at, and a
+    /// row of the queue a jump names. Searches outward from `target`, so it stops at the nearest
+    /// match. A `target` outside the list counts from its nearer end.
+    nonisolated func nearestIndex(to target: Int, where predicate: (Element) -> Bool) -> Int? {
+        guard !isEmpty else { return nil }
+        let target = Swift.min(Swift.max(target, 0), count - 1)
+        for distance in 0 ... Swift.max(target, count - 1 - target) {
+            if target - distance >= 0, predicate(self[target - distance]) {
+                return target - distance
+            }
+            if distance > 0, target + distance < count, predicate(self[target + distance]) {
+                return target + distance
+            }
+        }
+        return nil
+    }
+}
+
+// MARK: - Duration Formatting
+
+/// Format milliseconds as track time (e.g., "3:45")
+nonisolated func formatTrackTime(milliseconds: Int) -> String {
+    let totalSeconds = milliseconds / 1000
+    let minutes = totalSeconds / 60
+    let seconds = totalSeconds % 60
+    // Using String(format:) intentionally: .formatted() is locale-sensitive and
+    // can produce non-ASCII digits (e.g. Arabic-Indic) in some locales. Track
+    // time is a technical display value that must always render as ASCII "3:05".
+    return String(format: "%d:%02d", minutes, seconds)
+}
+
+/// How long an album or playlist lasts, in hours and minutes, in the app's language: "2 hr,
+/// 44 min", "2 Std., 44 Min.", "2 h et 44 min". Minutes are whole ones played, rounded down, and
+/// a zero hour or minute is left out ("1 hr"), except for "0 min".
+nonisolated func formatDuration(milliseconds: Int, locale: Locale = .autoupdatingCurrent) -> String {
+    Duration.milliseconds(milliseconds).formatted(
+        .units(allowed: [.hours, .minutes], width: .abbreviated, fractionalPart: .hide(rounded: .down))
+            .locale(locale),
+    )
+}
+
+/// An album's release date in the app's language, as precise as it is stored
+/// (`PathfinderReleaseDate.formatted`): "Sep 26, 1969", "26. Sept. 1969" or "26 sept. 1969" for
+/// a day, "Sep 1969" for a month, "1969" for a year. Anything else is shown as it came.
+nonisolated func formatReleaseDate(_ releaseDate: String, locale: Locale = .autoupdatingCurrent) -> String {
+    let parts = releaseDate.split(separator: "-").map { Int($0) }
+    guard (1 ... 3).contains(parts.count), let year = parts[0] else { return releaseDate }
+
+    // Built and formatted in UTC, so no time zone moves the day.
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = .gmt
+    let components = DateComponents(year: year, month: parts.count > 1 ? parts[1] : 1, day: parts.count > 2 ? parts[2] : 1)
+    guard let date = calendar.date(from: components) else { return releaseDate }
+
+    let style = Date.FormatStyle(locale: locale, calendar: calendar, timeZone: .gmt)
+    return switch parts.count {
+    case 3: date.formatted(style.year().month(.abbreviated).day())
+    case 2: date.formatted(style.year().month(.abbreviated))
+    default: date.formatted(style.year())
+    }
+}
+
+/// Calculate total duration from a sequence of tracks
+func totalDuration(of tracks: some Sequence<Track>) -> String {
+    let totalMs = tracks.reduce(0) { $0 + $1.durationMs }
+    return formatDuration(milliseconds: totalMs)
+}
+
+// MARK: - Pagination State
+
+/// Tracks pagination state for a collection.
+struct PaginationState: Encodable {
+    var isLoaded = false
+    var isLoading = false
+    var hasMore = true
+    var nextOffset: Int? = 0
+    var total: Int = 0
+    /// Why the last page failed to load, until the list's next load starts. Here rather than in
+    /// the list's view, because the toolbar's refresh loads the list too.
+    var failure: LoadFailure?
+
+    mutating func reset() {
+        isLoaded = false
+        isLoading = false
+        hasMore = true
+        nextOffset = 0
+        total = 0
+        failure = nil
+    }
+
+    /// Records a page that has arrived, and works out whether to ask for another.
+    ///
+    /// The Web API used to answer this directly, with a `next` URL that was null on the last
+    /// page. The client APIs report a `totalCount` instead and leave the arithmetic here, so the
+    /// offset advances by **how many entries came back**, not by how many the caller could use.
+    /// Those differ: a page of the library can hold folders, and a page of saved tracks can name
+    /// the same relinked recording twice. Advancing by the usable count would re-request the
+    /// difference on every page and never reach the end.
+    ///
+    /// `receivedCount == 0` ends the list whatever `total` claims — otherwise a total that
+    /// overcounts what the pages actually yield would leave `hasMore` true forever, and the
+    /// list views ask for more as long as it is.
+    mutating func advance(by receivedCount: Int, total: Int) {
+        let offset = (nextOffset ?? 0) + receivedCount
+
+        self.total = total
+        nextOffset = offset
+        hasMore = receivedCount > 0 && offset < total
+    }
+}

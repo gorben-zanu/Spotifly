@@ -1,0 +1,46 @@
+//
+//  ArtistCard.swift
+//  Spotifly
+//
+//  Reusable circular artist card for horizontal scroll sections
+//
+
+import SwiftUI
+
+struct ArtistCard: View {
+    let id: String
+    let name: String
+    let images: ImageSet
+    var size = Artwork.cardSize
+
+    @Environment(NavigationCoordinator.self) private var navigationCoordinator
+
+    var body: some View {
+        Button {
+            navigationCoordinator.navigateToArtistSection(artistId: id)
+        } label: {
+            VStack(spacing: 8) {
+                Artwork.card(images, size: size, shape: AnyShape(.circle), symbol: "person.circle.fill", symbolSize: 60)
+
+                Text(name)
+                    .font(.headline)
+                    .lineLimit(1)
+                    .multilineTextAlignment(.center)
+                    .frame(width: size)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Convenience initializers
+
+extension ArtistCard {
+    /// Initialize from an Artist entity
+    init(artist: Artist, size: CGFloat = Artwork.cardSize) {
+        id = artist.id
+        name = artist.name
+        images = artist.images
+        self.size = size
+    }
+}

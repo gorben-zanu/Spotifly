@@ -1,0 +1,134 @@
+//
+//  DeviceService.swift
+//  Spotifly
+//
+//  Service for Spotify Connect device operations.
+//
+
+import Foundation
+
+/// Transfers playback between Connect devices.
+///
+/// **Devices are not loaded; they arrive.** The cluster pushes the device list over the
+/// dealer socket, and `PlayerModel` holds it. A push alone is not enough to start with: the
+/// dealer only carries *changes*, and this device's own registration is answered over HTTP
+/// rather than pushed, so on a quiet account nothing arrived at all. `SpircController`
+/// adopts the cluster that answers its PutState as well, and both reach the model the same
+/// way.
+@MainActor
+@Observable
+final class DeviceService {
+    private let player: PlayerModel
+
+    /// The transfer currently in flight, if any. Transfers are chained onto it so no two
+    /// ever overlap — see `transferPlayback(to:)`.
+    private var transferTask: Task<Bool, Never>?
+
+    init(player: PlayerModel = .shared) {
+        self.player = player
+    }
+
+    // MARK: - Playback Transfer
+
+    /// Transfer playback to a specific device.
+    /// Uses native Spotify Connect protocol for seamless handoff.
+    /// Returns true if transfer succeeded (caller should activate Connect mode)
+    ///
+    /// Every speaker row launches its own task, so two taps can call this concurrently.
+    /// Each attempt optimistically marks its target active and undoes that if the transfer
+    /// is refused, which is only sound while no other attempt is in flight: overlapping
+    /// ones capture each other's optimistic values as the state to restore. Chaining onto
+    /// the previous transfer keeps that from arising at all, and the later tap — the user's
+    /// actual intent — still wins, because it runs last.
+    func transferPlayback(to device: Device) async -> Bool {
+        let previous = transferTask
+        let task = Task { @MainActor in
+            _ = await previous?.value
+            return await performTransfer(to: device)
+        }
+        transferTask = task
+        defer {
+            if transferTask == task {
+                transferTask = nil
+            }
+        }
+        return await task.value
+    }
+
+    private func performTransfer(to device: Device) async -> Bool {
+        // Optimistically mark the target device as active for immediate UI feedback,
+        // remembering the previous one so a rejected transfer can be undone
+        let previousActiveDeviceId = player.activeDeviceId
+        let revisionBeforeTransfer = player.clusterRevision
+        player.setActiveDevice(device.id)
+
+        // Check if target is our local device
+        let isLocalDevice = device.id == player.ownDeviceId
+
+        let accepted = if isLocalDevice {
+            // Transfer TO local - use Spirc's native transfer
+            await SpotifyPlayer.transferToLocal()
+        } else {
+            // Transfer FROM local to remote device
+            await SpotifyPlayer.transferPlayback(to: device.id)
+        }
+
+        // The transfer can fail: no local device id yet, or connect-state refusing the
+        // command. Roll the optimistic update back rather than leaving the UI showing a
+        // device that never became active, and report the failure to the caller.
+        guard accepted else {
+            debugLog("DeviceService", "Transfer to \(device.name) was rejected")
+            // Only undo the guess this call made. Serializing transfers rules out a
+            // competing tap, but not the cluster: another client can activate a device
+            // while this transfer is awaited, and that fact outranks restoring what was
+            // true before the tap — including when it names the very device asked for,
+            // which the active id alone cannot distinguish from the optimistic update.
+            if player.clusterRevision == revisionBeforeTransfer {
+                player.setActiveDevice(previousActiveDeviceId)
+            }
+            return false
+        }
+
+        // Nothing to schedule: the transfer changes the cluster, and the cluster pushes the
+        // new device list and active device back on its own.
+        return true
+    }
+
+    // MARK: - Helpers
+
+    /// What a device type is called, as the Connect list says it: "Computer", "Smartphone",
+    /// "Speaker", and the cluster's own word for a type with no name here.
+    func deviceTypeName(for type: String) -> String {
+        switch type.lowercased() {
+        case "computer": String(localized: "device_type.computer")
+        case "smartphone": String(localized: "device_type.smartphone")
+        case "tablet": String(localized: "device_type.tablet")
+        case "speaker": String(localized: "device_type.speaker")
+        case "tv": String(localized: "device_type.tv")
+        case "avr": String(localized: "device_type.avr")
+        case "stb": String(localized: "device_type.stb")
+        case "automobile": String(localized: "device_type.automobile")
+        default: type
+        }
+    }
+
+    /// Get appropriate icon name for device type
+    func deviceIcon(for type: String) -> String {
+        switch type.lowercased() {
+        case "computer":
+            "desktopcomputer"
+        case "smartphone":
+            "iphone"
+        case "speaker":
+            "hifispeaker"
+        case "tv":
+            "tv"
+        case "avr", "stb":
+            "appletv"
+        case "automobile":
+            "car"
+        default:
+            "speaker.wave.2"
+        }
+    }
+}

@@ -1,0 +1,598 @@
+//
+//  SpclientAPI.swift
+//  Spotifly
+//
+//  The REST half of the client's own API, at spclient.wg.spotify.com, and the image upload
+//  beside it.
+//
+
+import Foundation
+
+nonisolated enum SpclientError: Error, LocalizedError {
+    case invalidId(String)
+    case preflightRejected(Int)
+    case requestFailed(Int, String)
+    case malformedResponse
+    /// A library write asked for before the profile loaded. The rootlist is addressed by the
+    /// account's own username, so there is no way to name it yet.
+    case accountUnknown
+
+    var errorDescription: String? {
+        switch self {
+        case let .invalidId(id):
+            "\(id) is not a Spotify id"
+        case .accountUnknown:
+            "Your account has not finished loading"
+        case let .preflightRejected(status):
+            "Spotify rejected the preflight (HTTP \(status))"
+        case let .requestFailed(status, detail):
+            detail.isEmpty
+                ? "Spotify rejected the request (HTTP \(status))"
+                : "Spotify rejected the request (HTTP \(status)): \(detail)"
+        case .malformedResponse:
+            "The Spotify response could not be read"
+        }
+    }
+
+    /// **Spotify declining, rather than something being wrong.**
+    ///
+    /// A connect-state command can fail because the target device or the current playback
+    /// state does not permit it, and neither is a fault the user can act on:
+    ///
+    /// - `403 skip_to_prev_restricted / no_prev_track` — Previous with nothing behind it.
+    /// - `400 DEVICE_DOES_NOT_SUPPORT_COMMAND` — an iPhone will not take a remote volume
+    ///   change, which is iOS policy rather than a Spotify one.
+    ///
+    /// Measured on 2026-08-13: thirteen of twenty-eight commands in one session came back this
+    /// way, every one of them a control the user had pressed deliberately. Reporting them as
+    /// errors makes the app look broken while it is behaving correctly.
+    var isDeclined: Bool {
+        guard case let .requestFailed(status, detail) = self else { return false }
+
+        return (status == 403 && detail.contains("restricted"))
+            || detail.contains("DEVICE_DOES_NOT_SUPPORT_COMMAND")
+    }
+
+    /// Whether this is Spotify saying there is nothing before the current track.
+    var isNoPreviousTrack: Bool {
+        guard case let .requestFailed(_, detail) = self else { return false }
+        return detail.contains("no_prev_track")
+    }
+}
+
+/// Track metadata as `metadata/4` returns it.
+///
+/// Deliberately a partial view. The endpoint returns considerably more than this — licensor
+/// uuids, catalogue insertion dates, per-format file ids — and decoding fields nothing reads
+/// only creates work when Spotify adds another one.
+nonisolated struct SpclientTrack: Decodable, Sendable {
+    struct Artist: Decodable, Sendable {
+        let gid: String?
+        let name: String?
+    }
+
+    struct Album: Decodable, Sendable {
+        struct CoverGroup: Decodable, Sendable {
+            struct Image: Decodable, Sendable {
+                let fileId: String?
+                let width: Int?
+                let height: Int?
+
+                enum CodingKeys: String, CodingKey {
+                    case fileId = "file_id"
+                    case width
+                    case height
+                }
+            }
+
+            let image: [Image]?
+        }
+
+        let gid: String?
+        let name: String?
+        let coverGroup: CoverGroup?
+
+        enum CodingKeys: String, CodingKey {
+            case gid
+            case name
+            case coverGroup = "cover_group"
+        }
+    }
+
+    /// Where the track may play. Asked for with `market=from_token`, the answer is already the
+    /// account's: a track its market does not have lists a restriction allowed in no country.
+    struct Restriction: Decodable, Sendable {
+        let countriesAllowed: String?
+        /// The tiers it is for, as librespot reads them; none named in any answer seen.
+        let catalogues: [String]?
+
+        enum CodingKeys: String, CodingKey {
+            case countriesAllowed = "countries_allowed"
+            case catalogues = "catalogue_str"
+        }
+
+        /// Whether it keeps a Premium account, the only kind that plays here, from the track
+        /// everywhere. One for another tier does not, as librespot counts only the account's.
+        var withholds: Bool {
+            countriesAllowed == "" && catalogues.map { $0.contains("premium") } != false
+        }
+    }
+
+    /// Another release of the track that does play in the account's market, which Spotify's
+    /// clients play in its place: relinking. Only whether there is one matters here.
+    struct Alternative: Decodable, Sendable {}
+
+    let gid: String?
+    let name: String?
+    let album: Album?
+    let artist: [Artist]?
+    let duration: Int?
+    let number: Int?
+    let discNumber: Int?
+    let restriction: [Restriction]?
+    let alternative: [Alternative]?
+
+    enum CodingKeys: String, CodingKey {
+        case gid
+        case name
+        case album
+        case artist
+        case duration
+        case number
+        case discNumber = "disc_number"
+        case restriction
+        case alternative
+    }
+
+    var artistNames: [String] {
+        (artist ?? []).compactMap(\.name)
+    }
+
+    /// Whether Spotify withholds the track from the account: a restriction allows it nowhere,
+    /// and no alternative plays in its place.
+    ///
+    /// Measured 2026-10-01 on 52 tracks of a library: 18 had `countries_allowed: ""`, 17 of them
+    /// with an alternative, and those play, relinked. The one without was "Girlfriend (feat.
+    /// Dâm-Funk)", which pathfinder calls `COUNTRY_RESTRICTED` and which has no file to play.
+    var isWithheld: Bool {
+        (restriction ?? []).contains(where: \.withholds) && (alternative ?? []).isEmpty
+    }
+}
+
+/// Reads metadata from `spclient.wg.spotify.com`, and writes playlists and Connect commands
+/// there; a playlist's cover image goes up to `image-upload.spotify.com`.
+///
+/// Same two credentials as `PartnerAPI` — bearer plus client token — but plain REST rather than
+/// persisted queries, which makes this the more stable half to depend on: there are no query
+/// hashes to rotate, and an entity comes back whole rather than field-selected.
+nonisolated struct SpclientAPI: Sendable {
+    static let baseURL = URL(string: "https://spclient.wg.spotify.com/")!
+
+    typealias Transport = SpotifyCredentials.Transport
+
+    private let credentials: SpotifyCredentials
+
+    init(credentials: SpotifyCredentials = .live) {
+        self.credentials = credentials
+    }
+
+    /// Track metadata for a base62 id, the form the rest of the app uses.
+    func track(id: String) async throws -> SpclientTrack {
+        guard let gid = SpotifyGID.gid(fromBase62: id) else {
+            throw SpclientError.invalidId(id)
+        }
+
+        let url = Self.baseURL.appending(path: "metadata/4/track/\(gid)")
+        return try await decode(SpclientTrack.self, from: get(url))
+    }
+
+    /// How many metadata requests are allowed to be in the air at once.
+    ///
+    /// `metadata/4` addresses one entity per request, where the Web API's `/v1/tracks` took
+    /// fifty ids at a time, so a queue hydration that was one request is now one per track.
+    /// Capped rather than unbounded: a fifty-track batch fired at once is a burst Spotify has
+    /// no reason to tolerate, and the waves cost little when the requests are small.
+    ///
+    /// The batching endpoint the real client uses for this is `extended-metadata`, which is
+    /// protobuf and deliberately out of scope until the Swift playback track needs it
+    /// (`plans/done/single-grant-partner-api.md`, task 6). Move this there if the request volume
+    /// ever shows up.
+    static let metadataConcurrency = 8
+
+    /// Track metadata for many ids, keyed by the id that was asked for.
+    ///
+    /// Ids Spotify has no track for are absent from the result rather than an error, matching
+    /// what `/v1/tracks` did with its positional nulls — callers read the absence as "asked,
+    /// and there is nothing". Every other failure throws, because `TrackService` remembers an
+    /// absent id and stops asking for it: a request that failed for a reason that might not
+    /// recur must not be recorded as a track that does not exist.
+    func tracks(ids: [String]) async throws -> [String: SpclientTrack] {
+        guard !ids.isEmpty else { return [:] }
+
+        var found: [String: SpclientTrack] = [:]
+
+        for start in stride(from: 0, to: ids.count, by: Self.metadataConcurrency) {
+            let wave = ids[start ..< min(start + Self.metadataConcurrency, ids.count)]
+
+            try await withThrowingTaskGroup(of: (String, SpclientTrack?).self) { group in
+                for id in wave {
+                    group.addTask { try await (id, trackIfPresent(id: id)) }
+                }
+                for try await (id, track) in group {
+                    guard let track else { continue }
+
+                    found[id] = track
+                }
+            }
+        }
+
+        return found
+    }
+
+    /// Nil for the two cases that mean "there is no such track", so they can be told apart
+    /// from a request that merely failed.
+    private func trackIfPresent(id: String) async throws -> SpclientTrack? {
+        do {
+            return try await track(id: id)
+        } catch let SpclientError.requestFailed(status, _) where status == 404 {
+            return nil
+        } catch SpclientError.invalidId {
+            return nil
+        }
+    }
+
+    // MARK: - Connect state
+
+    /// Sends a player command to the device currently holding playback.
+    ///
+    /// Replaces the `/me/player/*` transport endpoints. `from` is this app's own device id and
+    /// `to` is the active one — and the source segment is **not validated**: the backend derives
+    /// it from the session, which is why librespot's own transfer passes its own id for both
+    /// sides. Measured with three different `from` values on 2026-08-13, all accepted.
+    func sendCommand(_ command: ConnectCommand, from: String, to: String) async throws {
+        try await send(
+            method: "POST",
+            path: "connect-state/v1/player/command/from/\(from)/to/\(to)",
+            body: ConnectCommandEnvelope(command),
+        )
+    }
+
+    /// Hands playback to `to`.
+    ///
+    /// `POST /connect-state/v1/connect/transfer/from/{from}/to/{to}`, the call
+    /// librespot makes (`SpClient::transfer`). Its own path again, beside
+    /// volume rather than among the player commands, and no body in the plain
+    /// case — librespot passes `None` for the optional `TransferRequest`.
+    ///
+    /// **Naming the same device on both sides pulls playback here** from
+    /// whichever device holds it, which is how librespot takes over, and how
+    /// `transferToLocal` is expressed.
+    ///
+    /// This replaces a `PUT /me/player` on `api.spotify.com`, which could never
+    /// have worked: the only token this app holds comes from the desktop client
+    /// id, and that id is answered with 429 by every Web API endpoint — see
+    /// `KeymasterAuth.clientId`.
+    func transferPlayback(from: String, to: String) async throws {
+        try await send(
+            method: "POST",
+            path: "connect-state/v1/connect/transfer/from/\(from)/to/\(to)",
+            encoded: nil,
+        )
+    }
+
+    /// Sets a remote device's volume. Its own path and its own verb, unlike every other command.
+    func setVolume(percent: Int, from: String, to: String) async throws {
+        try await send(
+            method: "PUT",
+            path: "connect-state/v1/connect/volume/from/\(from)/to/\(to)",
+            body: ConnectVolume(percent: percent),
+        )
+    }
+
+    // MARK: - Playlist attributes
+
+    /// Creates a playlist and answers its id.
+    ///
+    /// **The new playlist is not in the library yet.** Creating it and listing it are separate
+    /// writes here, where `POST /me/playlists` did both — see `PlaylistService`, which follows
+    /// this with `addToLibrary`.
+    func createPlaylist(name: String, description: String? = nil) async throws -> String {
+        let data = try await send(
+            method: "POST",
+            path: "playlist/v2/playlist",
+            body: PlaylistCreation(name: name, description: description),
+        )
+
+        guard let id = try SpotifyURI.id(from: decode(PlaylistCreationReply.self, from: data).uri) else {
+            throw SpclientError.malformedResponse
+        }
+
+        return id
+    }
+
+    /// Renames a playlist, changes its description, or both. A nil field is left alone.
+    func changePlaylistAttributes(
+        id: String,
+        name: String? = nil,
+        description: String? = nil,
+    ) async throws {
+        try await changePlaylist(id: id, .attributes(name: name, description: description))
+    }
+
+    /// One change to a playlist's own attributes.
+    private func changePlaylist(id: String, _ op: PlaylistOp) async throws {
+        try await send(method: "POST", path: "playlist/v2/playlist/\(id)/changes", body: PlaylistListChanges(op))
+    }
+
+    // MARK: - Playlist cover
+
+    /// Where a playlist's cover image goes up, as the web player sends it (2026-10-02).
+    static let imageUploadURL = URL(string: "https://image-upload.spotify.com/v4/playlist")!
+
+    /// Sets a playlist's cover to `jpeg`, in the three requests the web player makes
+    /// (2026-10-02):
+    /// 1. the image itself to `image-upload`, which answers a token;
+    /// 2. the token to the playlist's `register-image`, which answers the image's id;
+    /// 3. that id as the playlist's `picture`, in the change a rename sends.
+    func changePlaylistCover(id: String, jpeg: Data) async throws {
+        var upload = URLRequest(url: Self.imageUploadURL)
+        upload.httpMethod = "POST"
+        upload.httpBody = jpeg
+        upload.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
+        let uploaded = try await decode(ImageUploadReply.self, from: send(upload))
+
+        let registered = try await send(method: "POST", path: "playlist/v2/playlist/\(id)/register-image", body: uploaded)
+        try await changePlaylist(id: id, .picture(decode(RegisteredImage.self, from: registered).picture))
+    }
+
+    /// Takes a playlist's cover away, as the web player's "Remove photo" does.
+    func removePlaylistCover(id: String) async throws {
+        try await changePlaylist(id: id, .removePicture)
+    }
+
+    /// `image-upload`'s answer, and `register-image`'s body: the token that names the upload.
+    private struct ImageUploadReply: Codable {
+        let uploadToken: String
+    }
+
+    /// `register-image`'s answer: the image's id, as the playlist's `picture` takes it.
+    private struct RegisteredImage: Decodable {
+        let picture: String
+    }
+
+    private func decode<Reply: Decodable>(_: Reply.Type, from data: Data) throws -> Reply {
+        guard let reply = try? JSONDecoder().decode(Reply.self, from: data) else {
+            throw SpclientError.malformedResponse
+        }
+        return reply
+    }
+
+    /// Adds a playlist to the user's library — which is what following one is.
+    func addPlaylistToLibrary(username: String, playlistId: String) async throws {
+        try await changeRootlist(username: username, .add(uris: [Self.uri(playlistId)]))
+    }
+
+    /// Drops a playlist from the user's library.
+    ///
+    /// **This is also how a playlist is deleted**, and the Web API said as much in its own way:
+    /// `DELETE /playlists/{id}/followers` was the call for both. A playlist the user owns is not
+    /// destroyed by it — it leaves their rootlist, and anyone else following it keeps it.
+    func removePlaylistFromLibrary(username: String, playlistId: String) async throws {
+        try await changeRootlist(username: username, .remove(uris: [Self.uri(playlistId)]))
+    }
+
+    /// The rootlist is the library's list of playlists, and it is a list like any other — so
+    /// membership is an `ADD` or a `REM` against it rather than an endpoint of its own.
+    ///
+    /// Addressed by **username**, not display name: this is the account's own id, which
+    /// `profileAttributes` supplies. Nothing else in the app needs it, which is why the callers
+    /// pass it down rather than this type holding a profile.
+    private func changeRootlist(username: String, _ op: PlaylistOp) async throws {
+        try await send(
+            method: "POST",
+            path: "playlist/v2/user/\(username)/rootlist/changes",
+            body: PlaylistListChanges(op),
+        )
+    }
+
+    private static func uri(_ playlistId: String) -> String {
+        "spotify:playlist:\(playlistId)"
+    }
+
+    /// The one request shape the write endpoints take: JSON in, status out.
+    ///
+    /// No preflight and no `market`, unlike `get` below: these are not catalogue reads, and the
+    /// probe established that a bare authorized request is accepted. Failure is reported by
+    /// status code rather than in the body — `404 DEVICE_NOT_FOUND` when a command's target is
+    /// gone — so unlike the pathfinder mutations there is no 200-that-means-no to unpick.
+    ///
+    /// The response body is handed back for the callers that need it; the connect commands
+    /// answer with an ack id nothing reads and discard it.
+    @discardableResult
+    private func send(
+        method: String,
+        path: String,
+        body: some Encodable & Sendable,
+    ) async throws -> Data {
+        try await send(method: method, path: path, encoded: JSONEncoder().encode(body))
+    }
+
+    /// The bodyless form. `connect-state`'s transfer takes no payload in the
+    /// common case, and an empty JSON object is not the same request.
+    @discardableResult
+    private func send(
+        method: String,
+        path: String,
+        encoded: Data?,
+    ) async throws -> Data {
+        var request = URLRequest(url: Self.baseURL.appending(path: path))
+        request.httpMethod = method
+        request.httpBody = encoded
+        if encoded != nil {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+        return try await send(request)
+    }
+
+    /// Any write, to any of the client's hosts: an image upload goes to its own.
+    private func send(_ request: URLRequest) async throws -> Data {
+        var request = request
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let method = request.httpMethod ?? "GET", path = request.url?.path ?? ""
+        debugLog("SpclientAPI", "[\(method)] \(request.url?.absoluteString ?? "")")
+
+        let sent = try await credentials.send(request)
+
+        guard (200 ..< 300).contains(sent.status) else {
+            debugLog(
+                "SpclientAPI",
+                "\(method) \(path) failed (HTTP \(sent.status)): \(String(decoding: sent.body.prefix(200), as: UTF8.self))",
+            )
+            throw SpclientError.requestFailed(
+                sent.status,
+                String(decoding: sent.body.prefix(300), as: UTF8.self),
+            )
+        }
+
+        return sent.body
+    }
+
+    // MARK: - Transport
+
+    private func get(_ url: URL) async throws -> Data {
+        // A read, so one that fails in a way that may pass is asked for again; `send`'s writes
+        // are not.
+        let sent = try await credentials.retryingPassingFailures {
+            try await credentials.retryingRefusedToken { try await getOnce(url) }
+        }
+
+        guard sent.status == 200 else {
+            throw SpclientError.requestFailed(sent.status, "")
+        }
+
+        return sent.body
+    }
+
+    private func getOnce(_ url: URL) async throws -> SpotifyCredentials.Attempt {
+        // The desktop client's web view sends a CORS preflight before these, and this endpoint
+        // is served to that origin — so the sequence is mimicked rather than the request sent
+        // bare. libspot does the same before metadata/4.
+        try await preflight(url)
+
+        var request = URLRequest(url: Self.withMarket(url))
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        debugLog("SpclientAPI", "[GET] \(request.url?.absoluteString ?? url.absoluteString)")
+
+        return try await credentials.attempt(request)
+    }
+
+    func preflight(_ url: URL) async throws {
+        var request = URLRequest(url: Self.withMarket(url))
+        request.httpMethod = "OPTIONS"
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        request.setValue("GET", forHTTPHeaderField: "Access-Control-Request-Method")
+        request.setValue(
+            "app-platform,authorization,client-token,spotify-app-version",
+            forHTTPHeaderField: "Access-Control-Request-Headers",
+        )
+        request.setValue(SpotifyCredentials.origin, forHTTPHeaderField: "Origin")
+        request.setValue(SpotifyCredentials.origin + "/", forHTTPHeaderField: "Referer")
+
+        debugLog("SpclientAPI", "[OPTIONS] \(request.url?.absoluteString ?? url.absoluteString)")
+
+        let (_, response) = try await credentials.transport(request)
+        guard let http = response as? HTTPURLResponse else {
+            throw SpclientError.malformedResponse
+        }
+        guard http.statusCode < 400 else {
+            throw SpclientError.preflightRejected(http.statusCode)
+        }
+    }
+
+    /// `market=from_token` resolves the catalogue against the account rather than the caller's
+    /// IP, which is what makes the response match what the user can actually play.
+    static func withMarket(_ url: URL) -> URL {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+        var items = components.queryItems ?? []
+        guard !items.contains(where: { $0.name == "market" }) else { return url }
+        items.append(URLQueryItem(name: "market", value: "from_token"))
+        components.queryItems = items
+        return components.url ?? url
+    }
+}
+
+/// Base62 ids to the hex "gid" spclient addresses entities by.
+///
+/// `spotify:track:6rqhFgbbKwnb9MLmUQDhG6` is the same 16 bytes as
+/// `metadata/4/track/d49fcea6…`, written in a different base. The Web API speaks the first
+/// form and spclient the second, so everything crossing between them passes through here.
+nonisolated enum SpotifyGID {
+    private static let alphabet = Array("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+    static func gid(fromBase62 id: String) -> String? {
+        guard !id.isEmpty, id.count <= 22 else { return nil }
+
+        // 16 bytes, big-endian, built by repeated multiply-and-add. Avoids needing 128-bit
+        // arithmetic, which Swift has no native type for.
+        var bytes = [UInt8](repeating: 0, count: 16)
+
+        for character in id {
+            guard let digit = alphabet.firstIndex(of: character) else { return nil }
+
+            var carry = digit
+            for index in stride(from: bytes.count - 1, through: 0, by: -1) {
+                let value = Int(bytes[index]) * 62 + carry
+                bytes[index] = UInt8(value & 0xFF)
+                carry = value >> 8
+            }
+
+            // Anything left over does not fit in 16 bytes, so it was never a Spotify id.
+            guard carry == 0 else { return nil }
+        }
+
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// The inverse, for the gids spclient uses to *reference* entities.
+    ///
+    /// A track's metadata names its album and artists by gid, and `AppStore` keys them by
+    /// base62, so a track fetched here cannot link anywhere without this. Nil rather than a
+    /// best effort on anything that is not 32 hex characters: a mangled id addresses some
+    /// other entity, and a nil album id merely leaves a track unlinked.
+    static func base62(fromGID gid: String) -> String? {
+        guard gid.count == 32 else { return nil }
+
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(16)
+        var index = gid.startIndex
+        while index < gid.endIndex {
+            let next = gid.index(index, offsetBy: 2)
+            guard let byte = UInt8(gid[index ..< next], radix: 16) else { return nil }
+            bytes.append(byte)
+            index = next
+        }
+
+        // Long division by 62 over the 16 bytes, least significant digit first, for the same
+        // reason the forward direction multiplies: Swift has no 128-bit integer.
+        var digits: [Character] = []
+        while bytes.contains(where: { $0 != 0 }) {
+            var remainder = 0
+            for position in bytes.indices {
+                let accumulated = remainder << 8 | Int(bytes[position])
+                bytes[position] = UInt8(accumulated / 62)
+                remainder = accumulated % 62
+            }
+            digits.append(alphabet[remainder])
+        }
+
+        // Spotify ids are a fixed 22 characters, zero-padded — `0000000000000000000001` is a
+        // real id shape, and trimming it to "1" would not resolve.
+        while digits.count < 22 {
+            digits.append("0")
+        }
+
+        return String(digits.reversed())
+    }
+}

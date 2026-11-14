@@ -1,0 +1,89 @@
+# Spotifly
+
+A lightweight Spotify player for macOS.
+
+**[Website](https://ralph.github.io/Spotifly/)** · **[Download](https://github.com/ralph/Spotifly/releases/latest)**
+
+## Screenshots
+
+### Album View
+![Album View](images/screenshot-album-view.png)
+
+### Miniplayer
+![Miniplayer](images/screenshot-miniplayer.png)
+
+## Installation
+
+### Direct Download
+
+1. Download the [latest release](https://github.com/ralph/spotifly/releases/latest)
+2. Extract the ZIP file
+3. Move `Spotifly.app` to your Applications folder
+4. Open Spotifly from Applications
+
+### Homebrew
+
+```bash
+brew install ralph/spotifly/spotifly
+```
+
+## Requirements
+
+- macOS 27 or later
+- Spotify Premium account
+
+## Features
+
+- Lightweight and fast
+- Native macOS app built with SwiftUI
+- A real Spotify Connect device — play here, or drive your phone and speakers from here
+- Your library: playlists, albums, followed artists and liked songs
+- Queue management with drag-and-drop reordering
+- Playback controls
+- Search functionality
+- Favorites management
+
+## Signing In
+
+1. Open Spotifly
+2. Click **Connect with Spotify**
+3. Authorize Spotifly in the browser tab that opens
+
+That is the whole setup: the one authorization both signs you in and makes this Mac available as a Spotify Connect device.
+
+## Keyboard Shortcuts
+
+### Playback
+
+| Shortcut | Action |
+|----------|--------|
+| Space | Play / Pause |
+| ⌘ → | Next track |
+| ⌘ ← | Previous track |
+| ⌘ L | Like / Unlike current track |
+
+### Navigation
+
+| Shortcut | Action |
+|----------|--------|
+| ⌘ 1 | Go to Favorites |
+| ⌘ 2 | Go to Playlists |
+| ⌘ 3 | Go to Albums |
+| ⌘ 4 | Go to Artists |
+| ⌘ F | Focus search field |
+| ⌘ R | Refresh (on startpage) |
+
+## Development
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for build instructions and architecture documentation.
+
+## Acknowledgements
+
+Spotifly's playback and Spotify Connect are written in Swift, following the protocol work
+of [librespot](https://github.com/librespot-org/librespot).
+Ogg Vorbis decoding uses Xiph.Org's [libogg and libvorbis](https://xiph.org/vorbis/),
+included as source under their BSD licenses.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

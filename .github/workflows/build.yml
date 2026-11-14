@@ -1,0 +1,61 @@
+name: build
+
+# Builds the app on a GitHub-hosted Mac so a machine with only the Command Line Tools can run
+# it: SwiftUI's macro plugin (`libSwiftUIMacros.dylib`) ships inside Xcode alone, so a local
+# build cannot compile the app at all. `build-unsigned.sh` signs the artifact afterwards.
+#
+# The runner is keyed to Xcode's major version rather than the OS (GitHub's `xcode-27` image,
+# arm64 macOS 27, generally available since 2026-10-15). It is free for public repositories.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          xcrun --show-sdk-version
+
+      - name: Build
+        # No signing: the runner holds no certificate for the team, and the app is signed on the
+        # machine that runs it (build-unsigned.sh). The keychain access group goes with the
+        # signature, so the build leaves it out with SPOTIFLY_NO_KEYCHAIN_GROUP, which
+        # KeychainManager reads.
+        run: |
+          xcodebuild \
+            -project Spotifly.xcodeproj \
+            -scheme Spotifly \
+            -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            SWIFT_ACTIVE_COMPILATION_CONDITIONS="DEBUG SPOTIFLY_NO_KEYCHAIN_GROUP" \
+            build
+
+      - name: Package
+        run: |
+          ls -la build/Build/Products/Debug/
+          ditto -c -k --keepParent build/Build/Products/Debug/Spotifly.app Spotifly.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Spotifly-app
+          path: Spotifly.zip
+          if-no-files-found: error
+
+      - name: Keep the build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build/Logs/Build/
+          if-no-files-found: ignore

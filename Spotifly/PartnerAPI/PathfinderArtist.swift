@@ -1,0 +1,153 @@
+//
+//  PathfinderArtist.swift
+//  Spotifly
+//
+//  What the artist operations send back.
+//
+
+import Foundation
+
+/// `{ "data": { "artistUnion": { … } } }`
+///
+/// Shared by `queryArtistOverview` and `queryArtistDiscographyAll`, which return the same
+/// envelope with different parts filled in — the overview brings a profile and a sampled
+/// discography, the discography query brings `discography.all` and nothing else.
+nonisolated struct PathfinderArtistResponse: Decodable, Sendable {
+    struct Payload: Decodable, Sendable {
+        let artistUnion: PathfinderArtistUnion?
+    }
+
+    let data: Payload?
+}
+
+/// # Genres
+///
+/// **There are none, anywhere.** Measured on 2026-08-13 against `queryArtistOverview`,
+/// `queryArtistDiscographyAll`, `queryArtistMinimal` and spclient's `metadata/4/artist` — the
+/// Web API's `/artists/{id}` returns `genres` and none of the client's own APIs do. Spotify's
+/// own artist pages do not show them either. So `Artist` no longer carries a genre list; the
+/// row that displayed one is gone rather than permanently empty.
+nonisolated struct PathfinderArtistUnion: Decodable, Sendable, PathfinderEntityUnion {
+    struct Profile: Decodable, Sendable {
+        let name: String?
+    }
+
+    struct Visuals: Decodable, Sendable {
+        let avatarImage: PathfinderImage?
+    }
+
+    /// The discography, whichever operation filled it in.
+    ///
+    /// The overview splits releases into `albums`, `singles` and `compilations`, each holding
+    /// a sample; `queryArtistDiscographyAll` puts every release in `all`, each with its `type`.
+    /// The app reads `all`, and groups it by type itself, falling back to the sampled sections.
+    struct Discography: Decodable, Sendable {
+        let all: PathfinderReleaseGroup?
+        let albums: PathfinderReleaseGroup?
+        let singles: PathfinderReleaseGroup?
+        let compilations: PathfinderReleaseGroup?
+    }
+
+    /// `Artist`, or `NotFound` for an artist this account cannot see; see
+    /// `PartnerAPIError.notFound`.
+    let typename: String?
+    let message: String?
+    let uri: String?
+    let id: String?
+    let profile: Profile?
+    let visuals: Visuals?
+    let discography: Discography?
+
+    private enum CodingKeys: String, CodingKey {
+        case typename = "__typename"
+        case message, uri, id, profile, visuals, discography
+    }
+
+    var artistId: String? {
+        id ?? uri.flatMap(SpotifyURI.id(from:))
+    }
+
+    /// Every release this response carries, in order, deduplicated by id.
+    ///
+    /// Sections overlap — `popularReleasesAlbums` repeats entries from `albums` — so a page
+    /// built from more than one of them would otherwise list the same album twice, which for a
+    /// SwiftUI `ForEach` keyed by album id is undefined behaviour rather than a repeated row.
+    var releases: [PathfinderRelease] {
+        let groups = [
+            discography?.all,
+            discography?.albums,
+            discography?.singles,
+            discography?.compilations,
+        ]
+
+        var seen = Set<String>()
+        return groups.compactMap(\.self).flatMap(\.releases).filter { release in
+            guard let id = release.releaseId else { return false }
+            return seen.insert(id).inserted
+        }
+    }
+}
+
+/// One section of a discography.
+///
+/// **Two item shapes, again.** Most sections wrap each entry as `items[].releases.items[]` —
+/// a release *group*, which can hold several editions of one record. But
+/// `popularReleasesAlbums` puts the release fields directly on `items[]` with no wrapper. Both
+/// are accepted rather than switched on per section, for the same reason `PathfinderItems`
+/// accepts both search shapes: the difference belongs to Spotify's stored queries, and the next
+/// section added is as likely to take either form.
+nonisolated struct PathfinderReleaseGroup: Decodable, Sendable {
+    struct Item: Decodable, Sendable {
+        /// What this entry holds: a whole group's releases, or the single release the entry
+        /// itself turned out to be.
+        let all: [PathfinderRelease]
+
+        private struct Group: Decodable {
+            struct Releases: Decodable {
+                let items: [PathfinderRelease]?
+            }
+
+            let releases: Releases?
+        }
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.singleValueContainer()
+
+            if let group = try? container.decode(Group.self), let releases = group.releases {
+                all = releases.items ?? []
+            } else if let release = try? container.decode(PathfinderRelease.self) {
+                all = [release]
+            } else {
+                all = []
+            }
+        }
+    }
+
+    let items: [Item]?
+    let totalCount: Int?
+
+    var releases: [PathfinderRelease] {
+        (items ?? []).flatMap(\.all)
+    }
+}
+
+/// One release — an album, single or compilation — as a discography lists it.
+nonisolated struct PathfinderRelease: Decodable, Sendable {
+    struct TrackCount: Decodable, Sendable {
+        let totalCount: Int?
+    }
+
+    let uri: String?
+    let id: String?
+    let name: String?
+    let type: String?
+    /// `queryArtistOverview` sends `{day, month, year, precision}`, `queryArtistDiscographyAll`
+    /// `{isoString, year, precision}`; see `PathfinderReleaseDate`.
+    let date: PathfinderReleaseDate?
+    let coverArt: PathfinderImage?
+    let tracks: TrackCount?
+
+    var releaseId: String? {
+        id ?? uri.flatMap(SpotifyURI.id(from:))
+    }
+}

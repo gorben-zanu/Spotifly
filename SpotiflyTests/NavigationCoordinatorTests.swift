@@ -1,0 +1,474 @@
+//
+//  NavigationCoordinatorTests.swift
+//  SpotiflyTests
+//
+
+import Foundation
+@testable import Spotifly
+import Testing
+
+@MainActor
+struct NavigationCoordinatorTests {
+    @Test func `every user initiated change is reachable by back`() {
+        let store = AppStore()
+        store.setSearchResults(emptySearchResults, for: "q")
+        let coordinator = NavigationCoordinator(store: store)
+        var visited = [coordinator.current]
+
+        coordinator.selectNavigationItem(.favorites)
+        visited.append(coordinator.current)
+        coordinator.selectNavigationItem(.albums)
+        visited.append(coordinator.current)
+        coordinator.selectAlbum("album-a")
+        visited.append(coordinator.current)
+        coordinator.navigateToArtistSection(artistId: "artist-a")
+        visited.append(coordinator.current)
+        coordinator.selectArtist("artist-b")
+        visited.append(coordinator.current)
+        coordinator.navigateToSearchResults(query: "q")
+        visited.append(coordinator.current)
+        coordinator.showSearchScope(.tracks)
+        visited.append(coordinator.current)
+        coordinator.selectNavigationItem(.playlists)
+        visited.append(coordinator.current)
+        coordinator.selectPlaylist("playlist-a")
+        visited.append(coordinator.current)
+        coordinator.selectNavigationItem(.queue)
+        visited.append(coordinator.current)
+        coordinator.selectNavigationItem(nil)
+        visited.append(coordinator.current)
+        coordinator.selectNavigationItem(.startpage)
+        visited.append(coordinator.current)
+
+        for expected in visited.dropLast().reversed() {
+            coordinator.navigateBackward()
+            #expect(coordinator.current == expected)
+        }
+
+        #expect(!coordinator.canNavigateBackward)
+        #expect(coordinator.current == .startpage)
+    }
+
+    @Test func `forward is cleared by new navigation after going back`() {
+        let coordinator = NavigationCoordinator(store: AppStore())
+        coordinator.selectNavigationItem(.albums)
+        coordinator.selectNavigationItem(.artists)
+        coordinator.navigateBackward()
+
+        #expect(coordinator.canNavigateForward)
+
+        coordinator.selectNavigationItem(.favorites)
+
+        #expect(!coordinator.canNavigateForward)
+        #expect(coordinator.current.section == .favorites)
+    }
+
+    @Test func `back and forward restore the identical route including a search's all-tracks page`() {
+        let store = AppStore()
+        store.setSearchResults(emptySearchResults, for: "q")
+        let coordinator = NavigationCoordinator(store: store)
+        coordinator.navigateToSearchResults(query: "q")
+        coordinator.showSearchScope(.tracks)
+        let expected = coordinator.current
+
+        coordinator.selectNavigationItem(.favorites)
+        coordinator.navigateBackward()
+        #expect(coordinator.current == expected)
+
+        coordinator.navigateForward()
+        #expect(coordinator.current.section == .favorites)
+        coordinator.navigateBackward()
+        #expect(coordinator.current == expected)
+    }
+
+    @Test func `automatic first library selection is not recorded`() {
+        let coordinator = NavigationCoordinator(store: AppStore())
+        coordinator.selectNavigationItem(.albums)
+        coordinator.selectAlbum("album-a", recordsHistory: false)
+
+        #expect(coordinator.current.selection == .album(id: "album-a"))
+        #expect(coordinator.back == [.startpage])
+
+        coordinator.navigateBackward()
+        #expect(coordinator.current == .startpage)
+        #expect(!coordinator.canNavigateBackward)
+    }
+
+    @Test func `automatic replacement cannot leave a no-op history step`() {
+        let coordinator = NavigationCoordinator(store: AppStore())
+        coordinator.selectNavigationItem(.albums)
+        coordinator.selectAlbum("album-a")
+        coordinator.selectAlbum("album-b")
+
+        coordinator.selectAlbum("album-a", recordsHistory: false)
+
+        #expect(coordinator.back.last != coordinator.current)
+        coordinator.navigateBackward()
+        #expect(coordinator.current.selection == nil)
+    }
+
+    @Test func `section reentry restores remembered selection without an extra step`() {
+        let coordinator = NavigationCoordinator(store: AppStore())
+        coordinator.selectNavigationItem(.albums)
+        coordinator.selectAlbum("album-a")
+        coordinator.selectNavigationItem(.artists)
+        let artistsRoute = coordinator.current
+
+        coordinator.selectNavigationItem(.albums)
+
+        #expect(coordinator.current.selection == .album(id: "album-a"))
+        coordinator.navigateBackward()
+        #expect(coordinator.current == artistsRoute)
+    }
+
+    @Test func `history titles name the section, the selection and the search scope`() {
+        let store = AppStore()
+        let coordinator = NavigationCoordinator(store: store)
+        store.upsertAlbum(album(id: "album-a", name: "Named Album"))
+        store.upsertArtist(artist(id: "artist-a", name: "Named Artist"))
+
+        coordinator.selectNavigationItem(.albums)
+        #expect(coordinator.backNavigationTitle == NavigationItem.startpage.title)
+
+        coordinator.selectAlbum("album-a")
+        coordinator.navigateBackward()
+        #expect(coordinator.forwardNavigationTitle == "Named Album")
+        coordinator.navigateForward()
+
+        coordinator.navigateToArtistSection(artistId: "artist-a")
+        coordinator.selectNavigationItem(.favorites)
+        #expect(coordinator.backNavigationTitle == "Named Artist")
+
+        store.setSearchResults(emptySearchResults, for: "q")
+        coordinator.navigateToSearchResults(query: "q")
+        coordinator.showSearchScope(.tracks)
+        coordinator.selectNavigationItem(.favorites)
+        #expect(coordinator.backNavigationTitle == SearchKind.tracks.title)
+    }
+
+    /// The entity is named by its section, never by its kind.
+    @Test func `a selection missing from the store is named by its section`() {
+        let coordinator = NavigationCoordinator(store: AppStore())
+        coordinator.selectNavigationItem(.albums)
+        coordinator.selectAlbum("missing-album")
+
+        coordinator.selectNavigationItem(.favorites)
+
+        #expect(coordinator.viewingAlbumId == nil)
+        #expect(coordinator.backNavigationTitle == NavigationItem.albums.title)
+    }
+
+    /// "Show all" is a page of the search, and Back leads to the results.
+    @Test func `all of a search's tracks is a step of its own`() {
+        let store = AppStore()
+        store.setSearchResults(emptySearchResults, for: "q")
+        let coordinator = NavigationCoordinator(store: store)
+        coordinator.navigateToSearchResults(query: "q")
+
+        coordinator.showSearchScope(.tracks)
+
+        #expect(coordinator.current == Route(section: .searchResults, query: "q", searchScope: .tracks))
+        #expect(coordinator.displayedSearchQuery == "q")
+        coordinator.navigateBackward()
+        #expect(coordinator.current == Route(section: .searchResults, query: "q"))
+    }
+
+    @Test func `all tracks opens only from a search`() {
+        let store = AppStore()
+        store.setSearchResults(emptySearchResults, for: "q")
+        let coordinator = NavigationCoordinator(store: store)
+        coordinator.selectNavigationItem(.albums)
+
+        coordinator.showSearchScope(.tracks)
+
+        #expect(coordinator.current == Route(section: .albums))
+    }
+
+    /// The sidebar's search row reopens the results, not the page of all tracks.
+    @Test func `the search row reopens the results page`() {
+        let store = AppStore()
+        store.setSearchResults(emptySearchResults, for: "q")
+        let coordinator = NavigationCoordinator(store: store)
+        coordinator.navigateToSearchResults(query: "q")
+        coordinator.showSearchScope(.tracks)
+        coordinator.selectNavigationItem(.albums)
+
+        coordinator.selectNavigationItem(.searchResults)
+
+        #expect(coordinator.current == Route(section: .searchResults, query: "q"))
+    }
+
+    @Test func `history cap drops oldest entries and back still works`() {
+        let coordinator = NavigationCoordinator(store: AppStore())
+
+        for index in 0 ..< (NavigationCoordinator.historyLimit + 5) {
+            coordinator.selectNavigationItem(index.isMultiple(of: 2) ? .albums : .artists)
+        }
+
+        #expect(coordinator.back.count == NavigationCoordinator.historyLimit)
+
+        for _ in 0 ..< NavigationCoordinator.historyLimit {
+            #expect(coordinator.canNavigateBackward)
+            coordinator.navigateBackward()
+        }
+        #expect(!coordinator.canNavigateBackward)
+    }
+
+    @Test func `restoring history does not record another history entry`() {
+        let coordinator = NavigationCoordinator(store: AppStore())
+        coordinator.selectNavigationItem(.albums)
+        coordinator.selectNavigationItem(.favorites)
+
+        coordinator.navigateBackward()
+
+        #expect(coordinator.current.section == .albums)
+        #expect(coordinator.back == [.startpage])
+        #expect(coordinator.forward.count == 1)
+
+        coordinator.navigateForward()
+        #expect(coordinator.current.section == .favorites)
+        #expect(coordinator.back.count == 2)
+        #expect(coordinator.forward.isEmpty)
+    }
+
+    @Test func `clearing sidebar selection records the empty location`() {
+        let coordinator = NavigationCoordinator(store: AppStore())
+        coordinator.selectNavigationItem(.albums)
+
+        coordinator.selectNavigationItem(nil)
+
+        #expect(coordinator.current.section == nil)
+        #expect(coordinator.current.selection == nil)
+        coordinator.navigateBackward()
+        #expect(coordinator.current.section == .albums)
+    }
+
+    @Test func `revisiting a route retains both nonadjacent entries`() {
+        let coordinator = NavigationCoordinator(store: AppStore())
+        coordinator.selectNavigationItem(.albums)
+        coordinator.selectNavigationItem(.startpage)
+
+        coordinator.navigateBackward()
+        #expect(coordinator.current.section == .albums)
+        coordinator.navigateBackward()
+        #expect(coordinator.current == .startpage)
+    }
+
+    @Test func `invalidation removes a deleted playlist from both history directions`() {
+        let store = AppStore()
+        let coordinator = NavigationCoordinator(store: store)
+        let playlist = playlist(id: "playlist-a")
+        store.upsertPlaylist(playlist)
+        store.addPlaylistToUserLibraryById(playlist.id)
+
+        coordinator.navigateToPlaylistSection(playlistId: playlist.id)
+        coordinator.selectNavigationItem(.albums)
+        coordinator.navigateToPlaylistSection(playlistId: playlist.id)
+        coordinator.navigateBackward()
+
+        store.removePlaylistFromUserLibrary(playlist.id)
+        coordinator.invalidateUnviewableRoutes()
+
+        #expect(coordinator.current.section == .albums)
+        #expect(!coordinator.back.contains { $0.selection == .playlist(id: playlist.id) })
+        #expect(!coordinator.forward.contains { $0.selection == .playlist(id: playlist.id) })
+
+        coordinator.selectNavigationItem(.playlists)
+        #expect(coordinator.current.selection == nil)
+    }
+
+    /// A search that failed has a page too, saying why, with Try again.
+    @Test func `a failed search opens its page, until results replace the failure`() {
+        let store = AppStore()
+        let coordinator = NavigationCoordinator(store: store)
+        store.setSearchFailure(URLError(.notConnectedToInternet), for: "q")
+
+        coordinator.navigateToSearchResults(query: "q")
+        #expect(coordinator.displayedSearchQuery == "q")
+        #expect(store.searchFailure(for: "q")?.canRetry == true)
+
+        store.setSearchResults(emptySearchResults, for: "q")
+        coordinator.invalidateUnviewableRoutes()
+        #expect(store.searchFailure(for: "q") == nil)
+        #expect(coordinator.displayedSearchQuery == "q")
+    }
+
+    @Test func `a failed search leaves the history with its failure`() {
+        let store = AppStore()
+        let coordinator = NavigationCoordinator(store: store)
+        store.setSearchFailure(URLError(.notConnectedToInternet), for: "q")
+        coordinator.navigateToSearchResults(query: "q")
+        coordinator.selectNavigationItem(.albums)
+
+        store.clearSearchFailure()
+        coordinator.invalidateUnviewableRoutes()
+
+        #expect(coordinator.current.section == .albums)
+        #expect(!coordinator.back.contains { $0.query == "q" })
+    }
+
+    @Test func `invalidation removes an evicted search from the whole history`() {
+        let store = AppStore()
+        let coordinator = NavigationCoordinator(store: store)
+        store.setSearchResults(emptySearchResults, for: "old")
+        coordinator.navigateToSearchResults(query: "old")
+        coordinator.selectNavigationItem(.albums)
+        coordinator.navigateBackward()
+        coordinator.navigateForward()
+
+        for index in 0 ..< AppStore.searchResultsLimit {
+            store.setSearchResults(emptySearchResults, for: "new-\(index)")
+        }
+        coordinator.invalidateUnviewableRoutes()
+
+        #expect(store.searchResults(for: "old") == nil)
+        #expect(coordinator.current.section == .albums)
+        #expect(!coordinator.back.contains { $0.query == "old" })
+        #expect(!coordinator.forward.contains { $0.query == "old" })
+    }
+
+    @Test func `invalidation collapses equal routes joined by a deletion`() {
+        let store = AppStore()
+        let coordinator = NavigationCoordinator(store: store)
+        let playlist = playlist(id: "playlist-a")
+        store.upsertPlaylist(playlist)
+        store.addPlaylistToUserLibraryById(playlist.id)
+
+        coordinator.navigateToPlaylistSection(playlistId: playlist.id)
+        coordinator.selectNavigationItem(.startpage)
+        store.removePlaylistFromUserLibrary(playlist.id)
+        coordinator.invalidateUnviewableRoutes()
+
+        #expect(coordinator.current == .startpage)
+        #expect(coordinator.back.isEmpty)
+        #expect(!coordinator.canNavigateBackward)
+    }
+
+    @Test func `two consecutive searches are separate locations`() {
+        let store = AppStore()
+        let coordinator = NavigationCoordinator(store: store)
+        store.setSearchResults(emptySearchResults, for: "a")
+        store.setSearchResults(emptySearchResults, for: "b")
+
+        coordinator.navigateToSearchResults(query: "a")
+        coordinator.navigateToSearchResults(query: "b")
+        coordinator.navigateBackward()
+        #expect(coordinator.displayedSearchQuery == "a")
+        #expect(store.searchResults(for: "a") != nil)
+
+        coordinator.navigateForward()
+        #expect(coordinator.displayedSearchQuery == "b")
+        #expect(store.searchResults(for: "b") != nil)
+    }
+
+    @Test func `clearing search leaves cached results reachable by back`() {
+        let store = AppStore()
+        let coordinator = NavigationCoordinator(store: store)
+        store.setSearchResults(emptySearchResults, for: "query")
+        coordinator.navigateToSearchResults(query: "query")
+
+        // Clearing the field leaves Search Results but does not evict its cache.
+        coordinator.selectNavigationItem(.startpage)
+        coordinator.navigateBackward()
+
+        #expect(coordinator.displayedSearchQuery == "query")
+        #expect(store.searchResults(for: "query") != nil)
+    }
+
+    @Test func `reopening search results uses the last displayed query`() {
+        let store = AppStore()
+        let coordinator = NavigationCoordinator(store: store)
+        store.setSearchResults(emptySearchResults, for: "a")
+        store.setSearchResults(emptySearchResults, for: "b")
+        coordinator.navigateToSearchResults(query: "a")
+        coordinator.navigateToSearchResults(query: "b")
+        coordinator.navigateBackward()
+        coordinator.selectNavigationItem(.albums)
+
+        coordinator.selectNavigationItem(.searchResults)
+
+        #expect(coordinator.displayedSearchQuery == "a")
+    }
+
+    /// The memo is never cleared, so it is read through the cache: a query the cache evicted
+    /// reopens nothing, and one whose page showed a failure is not remembered.
+    @Test func `the search row reopens neither an evicted nor a failed query`() {
+        let store = AppStore()
+        let coordinator = NavigationCoordinator(store: store)
+        store.setSearchResults(emptySearchResults, for: "shown")
+        coordinator.navigateToSearchResults(query: "shown")
+        store.setSearchFailure(URLError(.notConnectedToInternet), for: "failed")
+        coordinator.navigateToSearchResults(query: "failed")
+        #expect(coordinator.reopenableSearchQuery == "shown")
+
+        for index in 0 ..< AppStore.searchResultsLimit {
+            store.setSearchResults(emptySearchResults, for: "other-\(index)")
+        }
+
+        #expect(store.searchResults(for: "shown") == nil)
+        #expect(coordinator.reopenableSearchQuery == nil)
+    }
+
+    @Test func `search results cache is bounded and evicted routes are invalidated`() {
+        let store = AppStore()
+        let coordinator = NavigationCoordinator(store: store)
+
+        for index in 0 ... AppStore.searchResultsLimit {
+            let query = "query-\(index)"
+            store.setSearchResults(emptySearchResults, for: query)
+            coordinator.navigateToSearchResults(query: query)
+        }
+        coordinator.invalidateUnviewableRoutes()
+
+        #expect(store.searchResultsByQuery.count == AppStore.searchResultsLimit)
+        #expect(store.searchResults(for: "query-0") == nil)
+        #expect(!coordinator.back.contains { $0.query == "query-0" })
+        #expect(coordinator.displayedSearchQuery == "query-\(AppStore.searchResultsLimit)")
+    }
+
+    @Test func `library membership does not change route identity`() {
+        let store = AppStore()
+        let coordinator = NavigationCoordinator(store: store)
+        let album = album(id: "album-a", name: "Album")
+        store.upsertAlbum(album)
+        coordinator.navigateToAlbumSection(albumId: album.id)
+        let route = coordinator.current
+        let historyCount = coordinator.back.count
+
+        #expect(coordinator.viewingAlbumId == album.id)
+        store.addAlbumToUserLibrary(album.id)
+        coordinator.selectAlbum(album.id)
+
+        #expect(coordinator.current == route)
+        #expect(coordinator.back.count == historyCount)
+        #expect(coordinator.viewingAlbumId == nil)
+    }
+
+    @Test func `album deep link applies its route directly`() {
+        let coordinator = NavigationCoordinator(store: AppStore())
+        coordinator.navigateToAlbumSection(albumId: "album-a")
+        #expect(coordinator.current == Route(section: .albums, selection: .album(id: "album-a")))
+    }
+
+    @Test func `artist deep link applies its route directly`() {
+        let coordinator = NavigationCoordinator(store: AppStore())
+        coordinator.navigateToArtistSection(artistId: "artist-a")
+        #expect(coordinator.current == Route(section: .artists, selection: .artist(id: "artist-a")))
+    }
+
+    @Test func `playlist deep link applies its route directly`() {
+        let coordinator = NavigationCoordinator(store: AppStore())
+        coordinator.navigateToPlaylistSection(playlistId: "playlist-a")
+        #expect(coordinator.current == Route(section: .playlists, selection: .playlist(id: "playlist-a")))
+    }
+
+    @Test func `queue deep link applies its route directly`() {
+        let coordinator = NavigationCoordinator(store: AppStore())
+        coordinator.navigateToQueue()
+        #expect(coordinator.current == Route(section: .queue))
+    }
+
+    private var emptySearchResults: SearchResults {
+        SearchResults(albums: [], artists: [], playlists: [], tracks: [])
+    }
+}

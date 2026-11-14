@@ -1,0 +1,119 @@
+//
+//  PathfinderAlbum.swift
+//  Spotifly
+//
+//  What `getAlbum` sends back.
+//
+
+import Foundation
+
+/// `{ "data": { "albumUnion": { … } } }`
+///
+/// A different envelope from the search operations, which nest under `data.searchV2` — hence
+/// its own type rather than a case in `PathfinderResponse`.
+nonisolated struct PathfinderAlbumResponse: Decodable, Sendable {
+    struct Payload: Decodable, Sendable {
+        let albumUnion: PathfinderAlbumUnion?
+    }
+
+    let data: Payload?
+}
+
+/// An album and its tracks.
+///
+/// A partial view of what `getAlbum` returns, which also carries extracted cover-art colours,
+/// `moreAlbumsByArtist`, `watchFeedEntrypoint`, sharing info and pre-release scheduling. Decoding
+/// fields nothing renders only creates work the next time Spotify adds one.
+nonisolated struct PathfinderAlbumUnion: Decodable, Sendable, PathfinderEntityUnion {
+    struct ArtistList: Decodable, Sendable {
+        struct Item: Decodable, Sendable {
+            struct Profile: Decodable, Sendable {
+                let name: String?
+            }
+
+            let id: String?
+            let uri: String?
+            let profile: Profile?
+        }
+
+        let items: [Item]?
+    }
+
+    /// `tracksV2`, not `tracks` — and `getAlbumNameAndTracks`, the other album operation, uses
+    /// the same key for items carrying nothing but a `uri`. This is the one to ask.
+    struct TrackList: Decodable, Sendable {
+        struct Item: Decodable, Sendable {
+            let track: PathfinderAlbumTrack?
+            /// The row's uid, which Connect names the row by, as a handover does.
+            let uid: String?
+        }
+
+        let items: [Item]?
+        let totalCount: Int?
+    }
+
+    /// `Album`, or `NotFound` for an album this account cannot see; see
+    /// `PartnerAPIError.notFound`.
+    let typename: String?
+    let message: String?
+    let uri: String?
+    let name: String?
+    let type: String?
+    let date: PathfinderReleaseDate?
+    let coverArt: PathfinderImage?
+    let artists: ArtistList?
+    let tracksV2: TrackList?
+
+    private enum CodingKeys: String, CodingKey {
+        case typename = "__typename"
+        case message, uri, name, type, date, coverArt, artists, tracksV2
+    }
+
+    var id: String? {
+        uri.flatMap(SpotifyURI.id(from:))
+    }
+
+    var firstArtist: ArtistList.Item? {
+        artists?.items?.first
+    }
+
+    var tracks: [PathfinderAlbumTrack] {
+        (tracksV2?.items ?? []).compactMap(\.track)
+    }
+
+    /// Each row's track and uid, in the album's order.
+    var rowUids: [(uri: String, uid: String)] {
+        (tracksV2?.items ?? []).compactMap { item in
+            guard let uri = item.track?.uri, let uid = item.uid else { return nil }
+            return (uri, uid)
+        }
+    }
+}
+
+/// One track as the album view sees it.
+///
+/// Carries `relinkingInformation`, which search does not — so pathfinder *can* expose the
+/// relink relationship on this operation. It is deliberately not decoded: the app keys tracks
+/// by the market id, and the id here already is one (`AGENTS.md`, "Track identity is the market
+/// id"). Reading it would only invite reintroducing the second identity that rule removed.
+nonisolated struct PathfinderAlbumTrack: Decodable, Sendable {
+    let uri: String?
+    let name: String?
+    let trackNumber: Int?
+    let discNumber: Int?
+    let duration: PathfinderDuration?
+    let artists: PathfinderArtistList?
+    let playability: PathfinderPlayability?
+
+    var id: String? {
+        uri.flatMap(SpotifyURI.id(from:))
+    }
+
+    var artistNames: [String] {
+        artists?.names ?? []
+    }
+
+    var firstArtistId: String? {
+        artists?.firstId
+    }
+}
